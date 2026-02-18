@@ -328,7 +328,7 @@ pub mod runtime {
             // this. Just note that we want to change a usize safely across threads!
             // If you want to learn more Mara Bos' book `Rust Atomics and Locks` is
             // incredibly good:  https://marabos.nl/atomics/
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             // Arc is probably one of the more important types we'll use in the
             // executor. It lets us freely clone cheap references to the data which
             // we can use across threads while making it easy to not have to worry about
@@ -404,6 +404,9 @@ pub mod runtime {
         /// conjunction with `wait` to block until there are no more tasks on
         /// the executor.
         tasks: AtomicUsize,
+        /// A counter which tracks the total number of Tasks spawned. We use
+        /// this to assign tags to Tasks for tracking purposes.
+        tags: AtomicUsize,
     }
 
     /// Our runtime type is designed such that we only ever have one running.
@@ -424,14 +427,35 @@ pub mod runtime {
         /// since it's completed.
         fn start() {
             std::thread::spawn(|| loop {
-                let task = match Runtime::get().queue.lock().unwrap().pop_front() {
-                    Some(task) => task,
-                    None => continue,
+                let task = {
+                    let mut q_guard = Runtime::get().queue.lock().unwrap();
+                    let task = match q_guard.pop_front() {
+                        Some(task) => task,
+                        None => continue,
+                    };
+
+                    // The lock synchronizes these "polling" traces w.r.t. "created" traces.
+                    task.polling_trace();
+
+                    task
                 };
+
                 if task.will_block() {
                     while task.poll().is_pending() {}
-                } else if task.poll().is_pending() {
-                    task.wake();
+
+                    // Although the lock isn't held, these "completed" traces are still synchronized
+                    // w.r.t. "created" traces because they are produced in sequence with "polling"
+                    // traces, which are synchronized with the "created" traces using the lock.
+                    task.trace("Completed and Un-Blocked");
+                    for task in Runtime::get().queue.lock().unwrap().iter() {
+                        task.permit_polling_trace();
+                    }
+                } else {
+                    // Ditto. The comment in the blocking branch applies here too.
+                    match task.poll() {
+                        Poll::Ready(_) => task.trace("Completed"),
+                        Poll::Pending => task.wake(),
+                    }
                 }
             });
         }
@@ -466,6 +490,7 @@ pub mod runtime {
             },
             queue,
             tasks: AtomicUsize::new(0),
+            tags: AtomicUsize::new(0),
         }
     });
 
@@ -488,40 +513,41 @@ pub mod runtime {
     impl Spawner {
         /// This is the function that gets called by the `spawn` function to
         /// actually create a new `Task` in our queue. It takes the `Future`,
-        /// constructs a `Task` and then pushes it to the back of the queue.
-        fn spawn(self, future: impl Future<Output = ()> + Send + Sync + 'static) {
-            self.inner_spawn(Task::new(false, future));
-        }
-        /// This is the function that gets called by the `spawn_blocking` function to
-        /// actually create a new `Task` in our queue. It takes the `Future`,
-        /// constructs a `Task` and then pushes it to the front of the queue
-        /// where the runtime will check if it should block and then block until
-        /// this future completes.
-        fn spawn_blocking(self, future: impl Future<Output = ()> + Send + Sync + 'static) {
-            self.inner_spawn_blocking(Task::new(true, future));
+        /// constructs a `Task` and then pushes it onto the queue. If the
+        /// `Task` is blocking, it gets pushed onto the front, otherwise it
+        /// gets pushed onto the back. The runtime will keep blocking `Task`s
+        /// at the front of the queue until they complete.
+        fn spawn(self, block: bool, future: impl Future<Output = ()> + Send + Sync + 'static) {
+            self.inner_spawn(Task::new(block, future), true);
         }
         /// This function just takes a `Task` and pushes it onto the queue. We use this
-        /// both for spawning new `Task`s and to push old ones that get woken up
-        /// back onto the queue.
-        fn inner_spawn(self, task: Arc<Task>) {
-            self.queue.lock().unwrap().push_back(task);
-        }
-        /// This function takes a `Task` and pushes it to the front of the queue
-        /// if it is meant to block. We use this both for spawning new blocking
-        /// `Task`s and to push old ones that get woken up back onto the queue.
-        fn inner_spawn_blocking(self, task: Arc<Task>) {
-            self.queue.lock().unwrap().push_front(task);
+        /// both for newly spawned `Task`s and to push old ones that get woken up back
+        /// onto the queue. If the `Task` blocks, it is added to the front of the queue,
+        /// otherwise it is added to the back. If the `new` flag is true, then a trace
+        /// artefact is produced after grabbing the lock on the queue.
+        fn inner_spawn(self, task: Arc<Task>, new: bool) {
+            let mut q_guard = self.queue.lock().unwrap();
+
+            if new {
+                task.trace(if task.will_block() {"Created Blocking"} else {"Created"});
+            }
+
+            if task.will_block() {
+                q_guard.push_front(task);
+            } else {
+                q_guard.push_back(task);
+            }
         }
     }
 
     /// Spawn a non-blocking `Future` onto the `whorl` runtime
     pub fn spawn(future: impl Future<Output = ()> + Send + Sync + 'static) {
-        Runtime::spawner().spawn(future);
+        Runtime::spawner().spawn(false, future);
     }
     /// Block on a `Future` and stop others on the `whorl` runtime until this
     /// one completes.
     pub fn block_on(future: impl Future<Output = ()> + Send + Sync + 'static) {
-        Runtime::spawner().spawn_blocking(future);
+        Runtime::spawner().spawn(true, future);
     }
     /// Block further execution of a program until all of the tasks on the
     /// `whorl` runtime are completed.
@@ -549,6 +575,10 @@ pub mod runtime {
         /// We need a way to check if the runtime should block on this task and
         /// so we use a boolean here to check that!
         block: bool,
+        /// We use this to help identify Tasks for tracking/debugging purposes.
+        tag: usize,
+        /// Suppresses tracing-related polling notifications when set to true.
+        polled: AtomicBool,
     }
 
     impl Task {
@@ -557,9 +587,13 @@ pub mod runtime {
         /// in an `Arc`.
         fn new(block: bool, future: impl Future<Output = ()> + Send + Sync + 'static) -> Arc<Self> {
             Runtime::get().tasks.fetch_add(1, Ordering::Relaxed);
+            let tag = Runtime::get().tags.fetch_add(1, Ordering::AcqRel);
+
             Arc::new(Task {
                 future: Mutex::new(Box::pin(future)),
                 block,
+                tag,
+                polled: AtomicBool::new(false),
             })
         }
 
@@ -571,6 +605,29 @@ pub mod runtime {
         /// a `&Arc<Task>`. If it was just `Task` it would not compile or work.
         fn waker(self: &Arc<Self>) -> Waker {
             self.clone().into()
+        }
+
+        /// Produces a trace artefact unconditionally. Blocking `Task`s will
+        /// use a different header than non-blocking tasks.
+        fn trace(self: &Arc<Self>, text: &str) {
+            if self.block {
+                println!("-#{}- {}", self.tag, text);
+            } else {
+                println!("[#{}] {}", self.tag, text);
+            }
+        }
+
+        /// Produces a trace artefact if the `polled` flag is not set.
+        fn polling_trace(self: &Arc<Self>) {
+            if !self.polled.swap(true, Ordering::AcqRel) {
+                self.trace("\tPolling...");
+            }
+        }
+
+        /// Resets the `polled` flag to allow the `Task` to once again produce
+        /// trace artefacts.
+        fn permit_polling_trace(self: &Arc<Self>) {
+            self.polled.store(false, Ordering::Release);
         }
 
         /// This is a convenience method to `poll` a `Future` by creating the
@@ -591,7 +648,7 @@ pub mod runtime {
     /// Since we increase the count everytime we create a new task we also need
     /// to make sure that it *also* decreases the count every time it goes out
     /// of scope. This implementation of `Drop` does just that so that we don't
-    /// need to bookkeep about when and where to subtract from the count.
+    /// need to bookeep about when and where to subtract from the count.
     impl Drop for Task {
         fn drop(&mut self) {
             Runtime::get().tasks.fetch_sub(1, Ordering::Relaxed);
@@ -600,15 +657,10 @@ pub mod runtime {
 
     /// `Wake` is the crux of all of this executor as it's what lets us
     /// reschedule a task when it's ready to be polled. For our implementation
-    /// we do a simple check to see if the task blocks or not and then spawn it back
-    /// onto the executor in an appropriate manner.
+    /// we spawn it back onto the executor according to whether it blocks or not.
     impl Wake for Task {
         fn wake(self: Arc<Self>) {
-            if self.will_block() {
-                Runtime::spawner().inner_spawn_blocking(self);
-            } else {
-                Runtime::spawner().inner_spawn(self);
-            }
+            Runtime::spawner().inner_spawn(self, false);
         }
     }
 }
