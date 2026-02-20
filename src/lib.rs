@@ -517,7 +517,7 @@ pub mod runtime {
         /// `Task` is blocking, it gets pushed onto the front, otherwise it
         /// gets pushed onto the back. The runtime will keep blocking `Task`s
         /// at the front of the queue until they complete.
-        fn spawn(self, block: bool, future: impl Future<Output = ()> + Send + Sync + 'static) {
+        fn spawn(self, block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) {
             self.inner_spawn(Task::new(block, future), true);
         }
         /// This function just takes a `Task` and pushes it onto the queue. We use this
@@ -542,18 +542,24 @@ pub mod runtime {
 
     /// Spawn a non-blocking `Future` onto the `whorl` runtime
     pub fn spawn(future: impl Future<Output = ()> + Send + Sync + 'static) {
-        Runtime::spawner().spawn(false, future);
+        Runtime::spawner().spawn(Blocking::NonBlocking, future);
     }
     /// Block on a `Future` and stop others on the `whorl` runtime until this
     /// one completes.
     pub fn block_on(future: impl Future<Output = ()> + Send + Sync + 'static) {
-        Runtime::spawner().spawn(true, future);
+        Runtime::spawner().spawn(Blocking::Blocking, future);
     }
     /// Block further execution of a program until all of the tasks on the
     /// `whorl` runtime are completed.
     pub fn wait() {
         let runtime = Runtime::get();
         while runtime.tasks.load(Ordering::Relaxed) > 0 {}
+    }
+
+    /// An enum used to assert whether or not a `Task` will block.
+    enum Blocking {
+        NonBlocking,
+        Blocking,
     }
 
     /// The `Task` is the basic unit for the executor. It represents a `Future`
@@ -573,8 +579,8 @@ pub mod runtime {
         /// the type system that this type will not move anymore.
         future: Mutex<Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>>,
         /// We need a way to check if the runtime should block on this task and
-        /// so we use a boolean here to check that!
-        block: bool,
+        /// so we use an enum here to check that!
+        block: Blocking,
         /// We use this to help identify Tasks for tracking/debugging purposes.
         tag: usize,
         /// Suppresses tracing-related polling notifications when set to true.
@@ -585,7 +591,7 @@ pub mod runtime {
         /// This constructs a new task by increasing the count in the runtime of
         /// how many tasks there are, pinning the `Future`, and wrapping it all
         /// in an `Arc`.
-        fn new(block: bool, future: impl Future<Output = ()> + Send + Sync + 'static) -> Arc<Self> {
+        fn new(block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) -> Arc<Self> {
             Runtime::get().tasks.fetch_add(1, Ordering::Relaxed);
             let tag = Runtime::get().tags.fetch_add(1, Ordering::AcqRel);
 
@@ -610,11 +616,10 @@ pub mod runtime {
         /// Produces a trace artefact unconditionally. Blocking `Task`s will
         /// use a different header than non-blocking tasks.
         fn trace(self: &Arc<Self>, text: &str) {
-            if self.block {
-                println!("-#{}- {}", self.tag, text);
-            } else {
-                println!("[#{}] {}", self.tag, text);
-            }
+            match self.block {
+                Blocking::NonBlocking => println!("[#{}] {}", self.tag, text),
+                Blocking::Blocking => println!("-#{}- {}", self.tag, text),
+            };
         }
 
         /// Produces a trace artefact if the `polled` flag is not set.
@@ -641,14 +646,17 @@ pub mod runtime {
 
         /// Checks the `block` field to see if the `Task` is blocking.
         fn will_block(&self) -> bool {
-            self.block
+            match self.block {
+                Blocking::NonBlocking => false,
+                Blocking::Blocking => true,
+            }
         }
     }
 
     /// Since we increase the count everytime we create a new task we also need
     /// to make sure that it *also* decreases the count every time it goes out
     /// of scope. This implementation of `Drop` does just that so that we don't
-    /// need to bookeep about when and where to subtract from the count.
+    /// need to bookkeep about when and where to subtract from the count.
     impl Drop for Task {
         fn drop(&mut self) {
             Runtime::get().tasks.fetch_sub(1, Ordering::Relaxed);
