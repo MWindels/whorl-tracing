@@ -263,6 +263,10 @@ fn library_test() {
 
 pub mod runtime {
     use std::{
+        // Including this lets us use a handy little directive to automatically make
+        // types `Clone`. That is, it lets us make deep copies of types that we may
+        // or may not be able to make shallow copies of.
+        clone::Clone,
         // We need a place to put the futures that get spawned onto the runtime
         // somewhere and while we could use something like a `Vec`, we chose a
         // `LinkedList` here. One reason being that we can put tasks at the front of
@@ -328,13 +332,23 @@ pub mod runtime {
             // this. Just note that we want to change a usize safely across threads!
             // If you want to learn more Mara Bos' book `Rust Atomics and Locks` is
             // incredibly good:  https://marabos.nl/atomics/
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicUsize, Ordering},
             // Arc is probably one of the more important types we'll use in the
             // executor. It lets us freely clone cheap references to the data which
             // we can use across threads while making it easy to not have to worry about
             // complicated lifetimes since we can easily own the data with a call to
             // clone. It's one of my favorite types in the standard library.
             Arc,
+            // We use (zero-buffer) synchronous channels to pass futures to the executor
+            // thread. This lets us transmit futures between threads, and syncrhonize
+            // those threads at the point of transmission. Unlike in some other languages
+            // (e.g. Go), Rust's channels are strictly single-consumer. Hence why the module
+            // is named MPSC: Multiple Producer, Single Consumer. This is fine for what we're
+            // doing as we've only got a single thread resposible for creating tasks. That's
+            // a limitation of using tracing::subscriber::set_default to perform tracing in
+            // the executor (as opposed to tracing::subscriber::set_global_default, or a
+            // more complex multi-threaded arrangement).
+            mpsc::{SyncSender, Receiver, sync_channel},
             // Normally I would use `parking_lot` for a Mutex, but the goal is to
             // use stdlib only. A personal gripe is that it cares about Mutex
             // poisoning (when a thread panics with a hold on the lock), which is
@@ -381,12 +395,88 @@ pub mod runtime {
         },
     };
 
+    // TODO
+    use tracing::{Level, span::EnteredSpan, instrument::Instrument};
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    /// This is what actually drives all of our async code. We spawn a separate
+    /// executor thread that loops, popping tasks off of a queue and polling them.
+    /// After the executor is launched, an interface is returned which allows users
+    /// in other threads to communicate with the executor spawned here. Every call
+    /// to this function creates a new executor with its own runtime and interface.
+    pub fn start() -> Interface {
+        // Before spinning off a separate thread for the executor, we need to create
+        // some shared state and synchronization primitives.
+        let mut runtime = Runtime::new();
+        let (future_tx, future_rx) = sync_channel(0);
+
+        // Here we take some of the objects constructed above and bundle them together
+        // to build this executor's interface. Some of these (e.g. future_tx) will
+        // be used externally, others will be used internally (e.g. queue), while
+        // others still (e.g. tasks) will be used in both places.
+        let interface = Interface {
+            queue: runtime.queue.clone(),
+            tasks: Arc::new(AtomicUsize::new(0)),
+            future_tx,
+        };
+
+        // We'll also need to make a copy of the interface for external use.
+        let external_interface = interface.clone();
+
+        // Then we spin off the executor thread!
+        std::thread::spawn(move || {
+            // Before we start the executor's event loop, we set up a tracing::Subscriber
+            // so it can produce logs that we can interpret! This subscriber applies only
+            // to this thread.
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt::fmt()
+                    .with_span_events(FmtSpan::ACTIVE)
+                    .with_level(true)
+                    .with_max_level(Level::TRACE)
+                    .with_writer(std::io::stdout)
+                    .finish()
+            );
+
+            loop {
+                // This is the start of the executor's event loop. We begin by looking for new
+                // futures to add to the queue as Tasks.
+                runtime.queue_all(&interface, &future_rx);
+
+                // Next we try to pop a Task from the queue. This must be done before matching
+                // on the Task, otherwise we wouldn't release the lock!
+                let task = runtime.queue.lock().unwrap().dequeue();
+
+                match task {
+                    None => continue,
+                    Some(task) => {
+                        // If the queue had a Task on it, we poll() it. If the Task is blocking,
+                        // it is polled until completion. While a blocking Task is being polled we
+                        // keep looking for new Tasks coming in. If the Task is non-blocking, we put
+                        // it back into the queue if it's still pending. Otherwise, Tasks that are ready
+                        // are simply dropped from the queue as they're now finished running.
+                        if task.will_block() {
+                            while task.poll().is_pending() {
+                                runtime.queue_all(&interface, &future_rx);
+                            }
+                        } else {
+                            if task.poll().is_pending() {
+                                task.wake();
+                            }
+                        }
+                    },
+                };
+            }
+        });
+
+        external_interface
+    }
+
     /// This is it, the thing we've been alluding to for most of this file. It's
     /// the `Runtime`! What is it? What does it do? Well the `Runtime` is what
-    /// actually drives our async code to completion. Remember asynchronous code
-    /// is just code that gets run for a bit, yields part way through the
-    /// function, then continues when polled and it repeats this process till
-    /// being completed. In reality what this means is that the code is run
+    /// retains the state that helps the executor drive our async code to completion.
+    /// Remember asynchronous code is just code that gets run for a bit, yields part
+    /// way through the function, then continues when polled and it repeats this process
+    /// till being completed. In reality what this means is that the code is run
     /// using synchronous functions that drive tasks in a concurrent manner.
     /// They could also be run concurrently and/or in parallel if the executor
     /// is multithreaded. Tokio is a good example of this model where it runs
@@ -394,169 +484,150 @@ pub mod runtime {
     /// threads, it runs them concurrently on those threads.
     ///
     /// Our `Runtime` in particular has:
-    pub(crate) struct Runtime {
+    struct Runtime {
         /// A queue to place all of the tasks that are spawned on the runtime.
-        queue: Queue,
-        /// A `Spawner` which can spawn tasks onto our queue for us easily and
-        /// lets us call `spawn` and `block_on` with ease.
-        spawner: Spawner,
-        /// A counter for how many Tasks are on the runtime. We use this in
-        /// conjunction with `wait` to block until there are no more tasks on
-        /// the executor.
-        tasks: AtomicUsize,
-        /// A counter which tracks the total number of Tasks spawned. We use
-        /// this to assign tags to Tasks for tracking purposes.
-        tags: AtomicUsize,
+        /// The queue is wrapped in an `Arc<Mutex<...>>` to enable an access
+        /// pattern called "interior mutability". This permits more fine-grained
+        /// access to queue references (mutable and immutable). This is important
+        /// for implementing `Wake` functionality on the `Task` type, because a
+        /// task must retain a reference to this queue to `requeue()` itself.
+        /// We can't just go around handing out mutable references to the queue,
+        /// as that would violate rules about exclusive ownership of mutable
+        /// references! Implementing `Wake` also requires that `Task` be `Sync`
+        /// (and that the reference to the queue it holds is also `Sync`), so we
+        /// use a `Mutex` rather than a `RefCell` even though the executor
+        /// is single-threaded. For more details on "interior mutability" see:
+        /// https://doc.rust-lang.org/book/ch15-05-interior-mutability.html
+        queue: Arc<Mutex<Queue>>,
+        /// A counter which tracks the total number of tasks spawned. We use
+        /// this to assign tags to tasks for tracking purposes.
+        tags: usize,
     }
 
-    /// Our runtime type is designed such that we only ever have one running.
-    /// You might want to have multiple running in production code though. For
-    /// instance you limit what happens on one runtime for a free tier version
-    /// and let the non-free version use as many resources as it can. We
-    /// implement 3 functions: `start` to actually get async code running, `get`
-    /// so that we can get references to the runtime, and `spawner` a
-    /// convenience function to get a `Spawner` to spawn tasks onto the `Runtime`.
+    /// Our `Runtime` type is designed such that we can have several running
+    /// simultaneously. In production code you might want multiple runtimes so
+    /// you can limit what happens on one for a free tier version and let the
+    /// non-free version use as many resources as it can.
+    /// 
+    /// Our runtime implements 3 functions: `new` to create a new `Runtime`,
+    /// `queue_new` to spawn a new task on the runtime, and `queue_all` to
+    /// spawn new tasks on the runtime for every future recieved through a
+    /// `Reciever` channel.
     impl Runtime {
-        /// This is what actually drives all of our async code. We spawn a
-        /// separate thread that loops getting the next task off the queue and
-        /// if it exists polls it or continues if not. It also checks if the
-        /// task should block and if it does it just keeps polling the task
-        /// until it completes! Otherwise it wakes the task to put it back in
-        /// the queue in the non-blocking version if it's still pending.
-        /// Otherwise it drops the task by not putting it back into the queue
-        /// since it's completed.
-        fn start() {
-            std::thread::spawn(|| loop {
-                let task = {
-                    let mut q_guard = Runtime::get().queue.lock().unwrap();
-                    let task = match q_guard.pop_front() {
-                        Some(task) => task,
-                        None => continue,
-                    };
-
-                    // The lock synchronizes these "polling" traces w.r.t. "created" traces.
-                    task.polling_trace();
-
-                    task
-                };
-
-                if task.will_block() {
-                    while task.poll().is_pending() {}
-
-                    // Although the lock isn't held, these "completed" traces are still synchronized
-                    // w.r.t. "created" traces because they are produced in sequence with "polling"
-                    // traces, which are synchronized with the "created" traces using the lock.
-                    task.trace("Completed and Un-Blocked");
-                    for task in Runtime::get().queue.lock().unwrap().iter() {
-                        task.permit_polling_trace();
-                    }
-                } else {
-                    // Ditto. The comment in the blocking branch applies here too.
-                    match task.poll() {
-                        Poll::Ready(_) => task.trace("Completed"),
-                        Poll::Pending => task.wake(),
-                    }
-                }
-            });
+        /// This creates a new Runtime.
+        fn new() -> Self {
+            Runtime {
+                queue: Arc::new(Mutex::new(Queue::new())),
+                tags: 0,
+            }
         }
 
-        /// A function to get a reference to the `Runtime`
-        pub(crate) fn get() -> &'static Runtime {
-            &RUNTIME
+        /// We use this to add a new task to the queue, incrementing the tag counter
+        /// at the same time.
+        fn queue_new(self: &mut Self, interface: &Interface, block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) {
+            self.queue.lock().unwrap().requeue(Task::new(interface.clone(), self.tags, block, future));
+            self.tags += 1;
         }
 
-        /// A function to get a new `Spawner` from the `Runtime`
-        pub(crate) fn spawner() -> Spawner {
-            Runtime::get().spawner.clone()
+        /// Here we read as many futures as we can from a `Receiver`. All futures read
+        /// from the channel are then added to the queue as new tasks.
+        fn queue_all(self: &mut Self, interface: &Interface, future_rx: &Receiver<TxRxFuture>) {
+            while let Ok((block, future)) = future_rx.try_recv() {
+                self.queue_new(interface, block, future);
+            }
         }
     }
 
-    /// We now create our static type to represent the singular `Runtime` when
-    /// it is finally initialized. We're using the LazyLock type added in Rust
-    /// 1.80.0 which allows us to safely initialize a static at runtime that
-    /// we can then refer too in our program
-    static RUNTIME: std::sync::LazyLock<Runtime> = std::sync::LazyLock::new(|| {
-        // This is okay to call because any calls to `Runtime::get()`
-        // will be blocked until we fully initialize the static which
-        // will block until it finishes initializing. So we start the runtime
-        // inside the initialization function, which depends on it being
-        // initialized, but it is able to wait until the runtime is actually
-        // initialized and so it all just works.
-        Runtime::start();
-        let queue = Arc::new(Mutex::new(LinkedList::new()));
-        Runtime {
-            spawner: Spawner {
-                queue: queue.clone(),
-            },
-            queue,
-            tasks: AtomicUsize::new(0),
-            tags: AtomicUsize::new(0),
-        }
-    });
-
-    // The queue is a single linked list that contains all of the tasks being
-    // run on it. We hand out access to it using a Mutex that has an Arc
-    // pointing to it so that we can make sure only one thing is touching the
-    // queue state at a given time. This isn't the most efficient pattern
-    // especially if we wanted to have the runtime be truly multi-threaded, but
-    // for the purposes of the code this works just fine.
-    type Queue = Arc<Mutex<LinkedList<Arc<Task>>>>;
-
-    /// We've talked about the `Spawner` a lot up till this point, but it's
-    /// really just a light wrapper around the queue that knows how to push
-    /// tasks onto the queue and create new ones.
+    /// The `Interface` provides the means for users in other threads to
+    /// interact with an executor. The `Task` objects internal to the
+    /// runtime also interact with higher-level data types (like the queue)
+    /// using the access/synchronization structures in this type.
     #[derive(Clone)]
-    pub(crate) struct Spawner {
-        queue: Queue,
+    pub struct Interface {
+        /// A shareable reference to a `Queue`. As noted elsewhere, the `Mutex`
+        /// helps enable "interior mutability".
+        queue: Arc<Mutex<Queue>>,
+        /// A counter for how many tasks are currently on the runtime. We use
+        /// this in conjunction with `wait()` to block until there are no more
+        /// tasks on the runtime.
+        tasks: Arc<AtomicUsize>,
+        /// A channel along which users can send futures to the executor to
+        /// spawn new tasks.
+        future_tx: SyncSender<TxRxFuture>,
     }
 
-    impl Spawner {
-        /// This is the function that gets called by the `spawn` function to
-        /// actually create a new `Task` in our queue. It takes the `Future`,
-        /// constructs a `Task` and then pushes it onto the queue. If the
-        /// `Task` is blocking, it gets pushed onto the front, otherwise it
-        /// gets pushed onto the back. The runtime will keep blocking `Task`s
-        /// at the front of the queue until they complete.
-        fn spawn(self, block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) {
-            self.inner_spawn(Task::new(block, future), true);
-        }
-        /// This function just takes a `Task` and pushes it onto the queue. We use this
-        /// both for newly spawned `Task`s and to push old ones that get woken up back
-        /// onto the queue. If the `Task` blocks, it is added to the front of the queue,
-        /// otherwise it is added to the back. If the `new` flag is true, then a trace
-        /// artefact is produced after grabbing the lock on the queue.
-        fn inner_spawn(self, task: Arc<Task>, new: bool) {
-            let mut q_guard = self.queue.lock().unwrap();
-
-            if new {
-                task.trace(if task.will_block() {"Created Blocking"} else {"Created"});
+    /// The Interface allows users of its runtime to perform a few different
+    /// functions. Users can `spawn` new non-blocking tasks, `block_on` new
+    /// blocking tasks and `wait` until all tasks on the runtime are complete.
+    impl Interface {
+        /// Spawn a non-blocking future onto the associated runtime.
+        pub fn spawn(self: &Self, future: impl Future<Output = ()> + Send + Sync + 'static) {
+            if let Ok(_) = self.future_tx.send((Blocking::NonBlocking, Box::pin(future))) {
+                self.tasks.fetch_add(1, Ordering::AcqRel);
             }
+        }
 
+        /// Block on a future and stop others on the associated runtime until this
+        /// one completes.
+        pub fn block_on(self: &Self, future: impl Future<Output = ()> + Send + Sync + 'static) {
+            if let Ok(_) = self.future_tx.send((Blocking::Blocking, Box::pin(future))) {
+                self.tasks.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        /// Block further execution of a program until all of the tasks on the associated
+        /// runtime are completed.
+        pub fn wait(self: &Self) {
+            // This operation is "Acquire" so that previous "AcqRel" fetch_add operations
+            // executed in the same thread are always visible to it. Essentially, we're
+            // ensuring that the compiler will never re-order fetch_add operations (from
+            // the same thread) before this load operation.
+            while self.tasks.load(Ordering::Acquire) > 0 {}
+        }
+    }
+
+    /// This is an alias for a pair composed of (1) a blocking/non-blocking directive and
+    /// (2) an associated future. This is used for transmission of task initialization
+    /// information through the channel held by an interface to its executor.
+    type TxRxFuture = (Blocking, Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>);
+
+    /// The `Queue` type encapsulates a singly-linked list that contains all of the tasks
+    /// being run on it. This type keeps no information about the `tracing::Span` objects
+    /// associated with live tasks, as it is meant to be `Sync` (shareable between threads).
+    /// This isn't the most efficient pattern especially if we wanted to have the runtime
+    /// be truly multi-threaded, but for the purposes of the code this works just fine.
+    struct Queue {
+        list: LinkedList<Arc<Task>>,
+    }
+
+    impl Queue {
+        /// Creates a new `Queue` object.
+        fn new() -> Self {
+            Queue {
+                list: LinkedList::new(),
+            }
+        }
+
+        /// This function removes a task from the front of the queue and returns it
+        /// if the queue is non-empty. Otherwise it returns `None`.
+        fn dequeue(self: &mut Self) -> Option<Arc<Task>> {
+            self.list.pop_front()
+        }
+
+        /// This function just takes a task and pushes it onto the queue. We use this
+        /// both for newly spawned tasks and to push old ones that get woken up back
+        /// onto the queue. If the task blocks, it is added to the front of the queue,
+        /// otherwise it is added to the back.
+        fn requeue(self: &mut Self, task: Arc<Task>) {
             if task.will_block() {
-                q_guard.push_front(task);
+                self.list.push_front(task);
             } else {
-                q_guard.push_back(task);
+                self.list.push_back(task);
             }
         }
     }
 
-    /// Spawn a non-blocking `Future` onto the `whorl` runtime
-    pub fn spawn(future: impl Future<Output = ()> + Send + Sync + 'static) {
-        Runtime::spawner().spawn(Blocking::NonBlocking, future);
-    }
-    /// Block on a `Future` and stop others on the `whorl` runtime until this
-    /// one completes.
-    pub fn block_on(future: impl Future<Output = ()> + Send + Sync + 'static) {
-        Runtime::spawner().spawn(Blocking::Blocking, future);
-    }
-    /// Block further execution of a program until all of the tasks on the
-    /// `whorl` runtime are completed.
-    pub fn wait() {
-        let runtime = Runtime::get();
-        while runtime.tasks.load(Ordering::Relaxed) > 0 {}
-    }
-
-    /// An enum used to assert whether or not a `Task` will block.
+    /// An enum used to assert whether or not a task or future will block.
     enum Blocking {
         NonBlocking,
         Blocking,
@@ -581,25 +652,21 @@ pub mod runtime {
         /// We need a way to check if the runtime should block on this task and
         /// so we use an enum here to check that!
         block: Blocking,
+        /// We need to know some information about the runtime on which this task
+        /// is being run, so we keep a copy of the runtime's interface.
+        interface: Interface,
         /// We use this to help identify Tasks for tracking/debugging purposes.
         tag: usize,
-        /// Suppresses tracing-related polling notifications when set to true.
-        polled: AtomicBool,
     }
 
     impl Task {
-        /// This constructs a new task by increasing the count in the runtime of
-        /// how many tasks there are, pinning the `Future`, and wrapping it all
-        /// in an `Arc`.
-        fn new(block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) -> Arc<Self> {
-            Runtime::get().tasks.fetch_add(1, Ordering::Relaxed);
-            let tag = Runtime::get().tags.fetch_add(1, Ordering::AcqRel);
-
+        /// This constructs a new task.
+        fn new(interface: Interface, tag: usize, block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) -> Arc<Self> {
             Arc::new(Task {
-                future: Mutex::new(Box::pin(future)),
+                future: Mutex::new(Box::pin(future.instrument(tracing::span!(Level::TRACE, "Future", Task=tag)))),
                 block,
+                interface,
                 tag,
-                polled: AtomicBool::new(false),
             })
         }
 
@@ -613,28 +680,6 @@ pub mod runtime {
             self.clone().into()
         }
 
-        /// Produces a trace artefact unconditionally. Blocking `Task`s will
-        /// use a different header than non-blocking tasks.
-        fn trace(self: &Arc<Self>, text: &str) {
-            match self.block {
-                Blocking::NonBlocking => println!("[#{}] {}", self.tag, text),
-                Blocking::Blocking => println!("-#{}- {}", self.tag, text),
-            };
-        }
-
-        /// Produces a trace artefact if the `polled` flag is not set.
-        fn polling_trace(self: &Arc<Self>) {
-            if !self.polled.swap(true, Ordering::AcqRel) {
-                self.trace("\tPolling...");
-            }
-        }
-
-        /// Resets the `polled` flag to allow the `Task` to once again produce
-        /// trace artefacts.
-        fn permit_polling_trace(self: &Arc<Self>) {
-            self.polled.store(false, Ordering::Release);
-        }
-
         /// This is a convenience method to `poll` a `Future` by creating the
         /// `Waker` and `Context` and then getting access to the actual `Future`
         /// inside the `Mutex` and calling `poll` on that.
@@ -645,7 +690,7 @@ pub mod runtime {
         }
 
         /// Checks the `block` field to see if the `Task` is blocking.
-        fn will_block(&self) -> bool {
+        fn will_block(self: &Self) -> bool {
             match self.block {
                 Blocking::NonBlocking => false,
                 Blocking::Blocking => true,
@@ -653,22 +698,23 @@ pub mod runtime {
         }
     }
 
-    /// Since we increase the count everytime we create a new task we also need
-    /// to make sure that it *also* decreases the count every time it goes out
-    /// of scope. This implementation of `Drop` does just that so that we don't
-    /// need to bookkeep about when and where to subtract from the count.
+    /// Since we increase the count everytime we send a new future to the
+    /// executor, we need to make sure that we *also* decrease the count every
+    /// time a task goes out of scope. This implementation of `Drop` does
+    /// just that so that we don't need to bookkeep about when and where to
+    /// subtract from the count.
     impl Drop for Task {
-        fn drop(&mut self) {
-            Runtime::get().tasks.fetch_sub(1, Ordering::Relaxed);
+        fn drop(self: &mut Self) {
+            self.interface.tasks.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
     /// `Wake` is the crux of all of this executor as it's what lets us
     /// reschedule a task when it's ready to be polled. For our implementation
-    /// we spawn it back onto the executor according to whether it blocks or not.
+    /// we push it back onto the runtime's queue according to whether or not it blocks.
     impl Wake for Task {
         fn wake(self: Arc<Self>) {
-            Runtime::spawner().inner_spawn(self, false);
+            self.interface.queue.lock().unwrap().requeue(self.clone());
         }
     }
 }
