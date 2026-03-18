@@ -267,21 +267,34 @@ pub mod runtime {
         // types `Clone`. That is, it lets us make deep copies of types that we may
         // or may not be able to make shallow copies of.
         clone::Clone,
-        // We need a place to put the futures that get spawned onto the runtime
-        // somewhere and while we could use something like a `Vec`, we chose a
-        // `LinkedList` here. One reason being that we can put tasks at the front of
-        // the queue if they're a blocking future. The other being that we use a
-        // constant amount of memory. We only ever use as much as we need for tasks.
-        // While this might not matter at a small scale, this does at a larger
-        // scale. If your `Vec` never gets smaller and you have a huge burst of
-        // tasks under, say, heavy HTTP loads in a web server, then you end up eating
-        // up a lot of memory that could be used for other things running on the
-        // same machine. In essence what you've created is a kind of memory leak
-        // unless you make sure to resize the `Vec`. @mycoliza did a good Twitter
-        // thread on this here if you want to learn more!
-        //
-        // https://twitter.com/mycoliza/status/1298399240121544705
-        collections::LinkedList,
+        collections::{
+            // We need a place to put the futures that get spawned onto the runtime
+            // somewhere and while we could use something like a `Vec`, we chose a
+            // `LinkedList` here. One reason being that we can put tasks at the front of
+            // the queue if they're a blocking future. The other being that we use a
+            // constant amount of memory. We only ever use as much as we need for tasks.
+            // While this might not matter at a small scale, this does at a larger
+            // scale. If your `Vec` never gets smaller and you have a huge burst of
+            // tasks under, say, heavy HTTP loads in a web server, then you end up eating
+            // up a lot of memory that could be used for other things running on the
+            // same machine. In essence what you've created is a kind of memory leak
+            // unless you make sure to resize the `Vec`. @mycoliza did a good Twitter
+            // thread on this here if you want to learn more!
+            //
+            // https://twitter.com/mycoliza/status/1298399240121544705
+            LinkedList,
+            // The HashMap is used here to maintain an association between tasks and
+            // `EnteredSpan` objects. Keeping these objects separated from each other
+            // allows us to pass tasks (and the queues they reside in) between threads
+            // without sending any span information with them. `EnteredSpan` objects
+            // cannot be passed between threads becasue the subscribers they relay
+            // events to may be thread-specific. Even when wrapped in an `Arc` and a
+            // `Mutex` these span guards cannot be made `Send`, because the `Mutex`
+            // type relies on the wrapped type (`EnteredSpan`) being `Send`.
+            //
+            // https://doc.rust-lang.org/std/sync/struct.Mutex.html#impl-Send-for-Mutex%3CT%3E
+            HashMap,
+        },
         // A Future is the fundamental block of any async executor. It is a trait
         // that types can make or an unnameable type that an async function can
         // make. We say it's unnameable because you don't actually define the type
@@ -396,7 +409,7 @@ pub mod runtime {
     };
 
     // TODO
-    use tracing::{Level, span::EnteredSpan, instrument::Instrument};
+    use tracing::{instrument::Instrument, span::EnteredSpan, Level};
     use tracing_subscriber::fmt::format::FmtSpan;
 
     /// This is what actually drives all of our async code. We spawn a separate
@@ -407,7 +420,7 @@ pub mod runtime {
     pub fn start() -> Interface {
         // Before spinning off a separate thread for the executor, we need to create
         // some shared state and synchronization primitives.
-        let mut runtime = Runtime::new();
+        let queue = Arc::new(Mutex::new(Queue::new()));
         let (future_tx, future_rx) = sync_channel(0);
 
         // Here we take some of the objects constructed above and bundle them together
@@ -415,7 +428,7 @@ pub mod runtime {
         // be used externally, others will be used internally (e.g. queue), while
         // others still (e.g. tasks) will be used in both places.
         let interface = Interface {
-            queue: runtime.queue.clone(),
+            queue: queue.clone(),
             tasks: Arc::new(AtomicUsize::new(0)),
             future_tx,
         };
@@ -430,12 +443,16 @@ pub mod runtime {
             // to this thread.
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::fmt::fmt()
-                    .with_span_events(FmtSpan::ACTIVE)
+                    .with_span_events(FmtSpan::NEW | FmtSpan::ENTER | FmtSpan::EXIT | FmtSpan::CLOSE)
                     .with_level(true)
                     .with_max_level(Level::TRACE)
                     .with_writer(std::io::stdout)
                     .finish()
             );
+
+            // Our runtime is not `Send` (because the `EnteredSpan` type is not `Send`) so we
+            // cannot move it into the executor thread and must create it here!
+            let mut runtime = Runtime::new(queue.clone());
 
             loop {
                 // This is the start of the executor's event loop. We begin by looking for new
@@ -458,9 +475,13 @@ pub mod runtime {
                             while task.poll().is_pending() {
                                 runtime.queue_all(&interface, &future_rx);
                             }
+
+                            runtime.exit_task_span(&task);
                         } else {
                             if task.poll().is_pending() {
                                 task.wake();
+                            } else {
+                                runtime.exit_task_span(&task);
                             }
                         }
                     },
@@ -502,6 +523,14 @@ pub mod runtime {
         /// A counter which tracks the total number of tasks spawned. We use
         /// this to assign tags to tasks for tracking purposes.
         tags: usize,
+        /// A `tracing::Span` to keep track of the lifetime of the runtime.
+        span: tracing::Span,
+        /// A key:value store to keep track of all tasks currently running. The
+        /// map's keys are task tags, and the values are guards associated with
+        /// `tracing::Span` objects. We need to keep the span guards in the runtime
+        /// so that the tasks and the queue implement `Send` (so they can be passed
+        /// between threads).
+        span_table: HashMap<usize, EnteredSpan>,
     }
 
     /// Our `Runtime` type is designed such that we can have several running
@@ -509,24 +538,56 @@ pub mod runtime {
     /// you can limit what happens on one for a free tier version and let the
     /// non-free version use as many resources as it can.
     /// 
-    /// Our runtime implements 3 functions: `new` to create a new `Runtime`,
-    /// `queue_new` to spawn a new task on the runtime, and `queue_all` to
-    /// spawn new tasks on the runtime for every future recieved through a
-    /// `Reciever` channel.
+    /// Our runtime implements 6 functions: `new` to create a new `Runtime`,
+    /// `queue_new` to spawn a new task on the runtime, `queue_all` to spawn
+    /// new tasks on the runtime for every future recieved through a `Reciever`
+    /// channel, and `create_task_span`, `enter_task_span`, and `exit_task_span`,
+    /// to respectively create, enter, and exit a `tracing::Span` associated
+    /// with a task.
     impl Runtime {
-        /// This creates a new Runtime.
-        fn new() -> Self {
-            Runtime {
-                queue: Arc::new(Mutex::new(Queue::new())),
+        /// This creates a new Runtime from an existing shareable queue.
+        fn new(queue: Arc<Mutex<Queue>>) -> Self {
+            // By holding the queue's lock for this scope only, we're implicitly
+            // assuming that any tasks added to the queue after this function returns
+            // are not new tasks, unless they are added by the executor who called
+            // this function.
+            let queue_guard = queue.lock().unwrap();
+
+            let mut runtime = Runtime {
+                queue: queue.clone(),
                 tags: 0,
+                span: tracing::span!(parent: None, Level::INFO, "Runtime"),
+                span_table: HashMap::new(),
+            };
+
+            // We basically assume that the queue is empty to start with. Only the
+            // executor should be adding tasks. However, the queue is technically shared
+            // through the runtime's interface (so that tasks can requeue themselves).
+            // So if we do find tasks already in the queue (for whatever reason) we
+            // issue warnings and try to cope as best as we can.
+            for task in queue_guard.list.iter() {
+                // We also assume that the tags used by any existing tasks are unique.
+                tracing::event!(parent: &runtime.span, Level::WARN, "Task{{Tag={}}} found in initial queue, associated future's span may be orphaned!", task.tag);
+                runtime.enter_task_span(task, runtime.create_task_span(task.tag, task.block));
+                runtime.tags = std::cmp::max(runtime.tags, task.tag + 1);
             }
+
+            if queue_guard.list.len() > 0 {
+                tracing::event!(parent: &runtime.span, Level::WARN, "Initial queue had {} tasks present, starting with tag={}.", queue_guard.list.len(), runtime.tags);
+            }
+
+            runtime
         }
 
         /// We use this to add a new task to the queue, incrementing the tag counter
         /// at the same time.
         fn queue_new(self: &mut Self, interface: &Interface, block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) {
-            self.queue.lock().unwrap().requeue(Task::new(interface.clone(), self.tags, block, future));
+            let task_span = self.create_task_span(self.tags, block);
+            let task = Task::new(interface.clone(), &task_span, self.tags, block, future);
             self.tags += 1;
+
+            self.enter_task_span(&task, task_span);
+            self.queue.lock().unwrap().requeue(task);
         }
 
         /// Here we read as many futures as we can from a `Receiver`. All futures read
@@ -535,6 +596,30 @@ pub mod runtime {
             while let Ok((block, future)) = future_rx.try_recv() {
                 self.queue_new(interface, block, future);
             }
+        }
+
+        /// This creates a new `tracing::Span` for a task.
+        fn create_task_span(self: &Self, tag: usize, block: Blocking) -> tracing::Span {
+            match block {
+                Blocking::NonBlocking => tracing::span!(parent: &self.span, Level::INFO, "Task", Tag=tag),
+                Blocking::Blocking => tracing::span!(parent: &self.span, Level::INFO, "Task", Tag=tag, "Blocking"),
+            }
+        }
+
+        /// This enters a `tracing::Span` associated with a task. A separation between
+        /// task and span (guard) is necessary, because the span guard is not `Send`.
+        /// Tasks must be `Send` so that the queue can be shared between threads.
+        fn enter_task_span(self: &mut Self, task: &Arc<Task>, span: tracing::Span) {
+            if self.span_table.contains_key(&task.tag) {
+                tracing::event!(parent: &self.span, Level::ERROR, "Task{{Tag={}}} was queued more than once! Overwriting task span!", task.tag);
+            }
+
+            self.span_table.insert(task.tag, span.entered());
+        }
+
+        /// This exits (and closes) a `tracing::Span` associated with a task.
+        fn exit_task_span(self: &mut Self, task: &Arc<Task>) {
+            self.span_table.remove(&task.tag);
         }
     }
 
@@ -628,6 +713,7 @@ pub mod runtime {
     }
 
     /// An enum used to assert whether or not a task or future will block.
+    #[derive(Clone, Copy)]
     enum Blocking {
         NonBlocking,
         Blocking,
@@ -661,9 +747,9 @@ pub mod runtime {
 
     impl Task {
         /// This constructs a new task.
-        fn new(interface: Interface, tag: usize, block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) -> Arc<Self> {
+        fn new(interface: Interface, span: &tracing::Span, tag: usize, block: Blocking, future: impl Future<Output = ()> + Send + Sync + 'static) -> Arc<Self> {
             Arc::new(Task {
-                future: Mutex::new(Box::pin(future.instrument(tracing::span!(Level::TRACE, "Future", Task=tag)))),
+                future: Mutex::new(Box::pin(future.instrument(tracing::span!(parent: span, Level::TRACE, "Future")))),
                 block,
                 interface,
                 tag,
